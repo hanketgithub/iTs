@@ -12,11 +12,16 @@
 
 #include "bits.h"
 
+#define TS_PKT_SYNC_BYTE                    0x47
 #define TS_PKT_SIZE                         188
 #define TS_PKT_HDR_MANDATORY_SIZE           4   // Sync_byte to Counitnuity_counter
 #define TS_PKT_HDR_ADAPTION_FIELD_LEN_SIZE  1
 
-#define PES_PKT_HDR_LEN             19   // should not be hard-coded, just for 20230221_original_asi_source_fix_frame_num.ts
+#define PES_PKT_HDR_PREFIX_SIZE     3
+#define PES_PKT_HDR_STREAM_ID_SIZE  1
+#define PES_PKT_HDR_PKT_LEN_SIZE    2
+#define PES_BITS_FIELDS_SIZE        2   // marker_bits to extension_flag
+#define PES_HDR_LEN_SIZE            1   // gives the len of the remainder of the PES headers in bytes
 
 using namespace std;
 
@@ -36,11 +41,11 @@ uint8_t *findPattern(uint8_t *src, uint8_t *pattern, uint32_t len)
 
 bool chkDistance(uint8_t distance, uint8_t adaptation_field_control, uint8_t adaptation_extension_length)
 {
-    int base_ts_hdr_len = 4;
+    int base_ts_hdr_len = TS_PKT_HDR_MANDATORY_SIZE;
 
     if (adaptation_field_control == 3)
     {
-        base_ts_hdr_len += 1 + adaptation_extension_length;
+        base_ts_hdr_len += TS_PKT_HDR_ADAPTION_FIELD_LEN_SIZE + adaptation_extension_length;
     }
 
     return distance == base_ts_hdr_len;
@@ -89,7 +94,7 @@ int main(int argc, char *argv[])
     uint8_t *ts_ptr = data;
 
     uint8_t last_continuity_counter = 0xF;
-    for (; ts_ptr - data < file_size; ts_ptr += 188)
+    for (; ts_ptr - data < file_size; ts_ptr += TS_PKT_SIZE)
     {
         InputBitstream_t ibs = {0};
 
@@ -104,7 +109,7 @@ int main(int argc, char *argv[])
         uint8_t adaptation_field_control        = READ_CODE(ibs, 2, "adaptation_field_control");
         uint8_t continuity_counter              = READ_CODE(ibs, 4, "continuity_counter");
 
-        if (sync_byte != 0x47)
+        if (sync_byte != TS_PKT_SYNC_BYTE)
         {
             printf("Invalid TS stream at 0x%lx, please chk!\n", ts_ptr - data);
             exit(-1);
@@ -125,24 +130,69 @@ int main(int argc, char *argv[])
                     adaptation_extension_length = READ_CODE(ibs, 8, "adaptation_extension_length");
                 }
 
-                uint8_t PESstartCode[] = { 0x00, 0x00, 0x01, 0xE0 };
-
-                uint8_t *pes = findPattern(&ibs.m_fifo[TS_PKT_HDR_MANDATORY_SIZE + adaptation_extension_length], PESstartCode, TS_PKT_SIZE - (TS_PKT_HDR_MANDATORY_SIZE + adaptation_extension_length));
-                if (pes == NULL)
+                uint8_t *pes;
+                if (0)
                 {
-                    printf("fucked up!\n");
+                    uint8_t PESstartCode[] = { 0x00, 0x00, 0x01, 0xE0 };
+
+                    pes = findPattern(&ibs.m_fifo[TS_PKT_HDR_MANDATORY_SIZE + adaptation_extension_length], PESstartCode, TS_PKT_SIZE - (TS_PKT_HDR_MANDATORY_SIZE + adaptation_extension_length));
+                    if (pes == NULL)
+                    {
+                        printf("fucked up!\n");
+                        exit(-1);
+                    }
+                    
+                    //printf("PES found! Offset=0x%lx distance=%ld\n", pes - data, pes - ts_ptr);
+
+                    if (!chkDistance(pes - ts_ptr, adaptation_field_control, adaptation_extension_length))
+                    {
+                        exit(-1);
+                    }
+                }
+                else
+                {
+                    pes = &ibs.m_fifo[TS_PKT_HDR_MANDATORY_SIZE];
+                    if (adaptation_field_control == 3)
+                    {
+                        pes += TS_PKT_HDR_ADAPTION_FIELD_LEN_SIZE + adaptation_extension_length;
+                    }
+                }
+
+                InputBitstream_t ibs1 = {0};
+
+                ibs1.m_fifo = pes;
+                uint32_t pes_prefix = READ_CODE(ibs1, 24, "PES prefix");
+                uint32_t stream_id  = READ_CODE(ibs1, 8, "stream id");
+                uint32_t pes_pkt_len = READ_CODE(ibs1, 16, "pkt_len");
+                uint32_t marker_bits = READ_CODE(ibs1, 2, "marker bits");
+                if (marker_bits != 0x2)
+                {
+                    printf("marker bits fucked up!\n");
                     exit(-1);
                 }
-                
-                //printf("PES found! Offset=0x%lx distance=%ld\n", pes - data, pes - ts_ptr);
 
-                if (!chkDistance(pes - ts_ptr, adaptation_field_control, adaptation_extension_length))
-                {
-                    exit(-1);
-                }
+                uint32_t scrambling_control     = READ_CODE(ibs1, 2, "scrambling_control");
+                bool priority                   = READ_FLAG(ibs1, "priority");
+                bool data_alignment_idc         = READ_FLAG(ibs1, "data_alignment_idc");
+                bool copyright                  = READ_FLAG(ibs1, "copyright");
+                bool original_or_copy           = READ_FLAG(ibs1, "original_or_copy");
+                uint32_t pts_dts_idc            = READ_CODE(ibs1, 2, "pts_dts_idc");
+                bool ESCR_flag                  = READ_FLAG(ibs1, "ESCR_flag");
+                bool ES_rate_flag               = READ_FLAG(ibs1, "ES_rate_flag");
+                bool DSM_trick_mode_flag        = READ_FLAG(ibs1, "DSM_trick_mode_flag");
+                bool additional_copy_info_flag  = READ_FLAG(ibs1, "additional_copy_info_flag");
+                bool CRC_flag                   = READ_FLAG(ibs1, "CRC_flag");
+                bool extension_flag             = READ_FLAG(ibs1, "extension_flag");
+                uint32_t pes_hdr_len            = READ_CODE(ibs1, 8, "pes_hdr_len");
 
                 // copy payload excluding PES header
-                uint8_t *copy = pes + PES_PKT_HDR_LEN;
+                uint8_t *copy = pes
+                                + PES_PKT_HDR_PREFIX_SIZE 
+                                + PES_PKT_HDR_STREAM_ID_SIZE 
+                                + PES_PKT_HDR_PKT_LEN_SIZE 
+                                + PES_BITS_FIELDS_SIZE
+                                + PES_HDR_LEN_SIZE
+                                + pes_hdr_len;
                 uint32_t cpSize = ts_ptr + TS_PKT_SIZE - copy;
 
                 copyQ.push_back( {copy, cpSize} );
@@ -197,11 +247,11 @@ int main(int argc, char *argv[])
             if (start - data > 0x3cb366) // 1st I
             {
                 write(ofd, start, len);
-                if (start - data > 0x44c994)
-                {
-                    printf("copy 0x%lx : %d\n", start - data, len);
-                    exit(-1);
-                }
+                //if (start - data > 0x44c994)
+                //{
+                //    printf("copy 0x%lx : %d\n", start - data, len);
+                //    exit(-1);
+                //}
             }
         }
 
