@@ -12,93 +12,36 @@
 
 #include "bits.h"
 
+#define TS_PKT_SIZE         188
+#define PES_PKT_HDR_LEN     19   // should not be hard-coded, just for 20230221_original_asi_source_fix_frame_num.ts
+
 using namespace std;
 
 
-#if 0
-typedef struct
+uint8_t *findPattern(uint8_t *src, uint8_t *pattern, uint32_t len)
 {
-    uint32_t m_num_held_bits;
-    uint8_t  m_held_bits;
-    uint32_t m_numBitsRead;
-
-    uint8_t *m_fifo;
-    uint32_t m_fifo_idx;
-    uint32_t m_fifo_size;
-} InputBitstream_t;
-
-
-/**
- * TComInputBitstream::read() in HM
- *
- * read_bits(n) in H.265 spec
- */
-static uint32_t read_bits(InputBitstream_t &bitstream, uint32_t uiNumberOfBits)
-{
-    //assert(uiNumberOfBits <= 32);
-    
-    bitstream.m_numBitsRead += uiNumberOfBits;
-
-    /* NB, bits are extracted from the MSB of each byte. */
-    uint32_t retval = 0;
-    
-    if (uiNumberOfBits <= bitstream.m_num_held_bits)
+    for (int i = 0; i < len; i++)
     {
-        /* n=1, len(H)=7:   -VHH HHHH, shift_down=6, mask=0xfe
-         * n=3, len(H)=7:   -VVV HHHH, shift_down=4, mask=0xf8
-         */
-        retval = bitstream.m_held_bits >> (bitstream.m_num_held_bits - uiNumberOfBits);
-        retval &= ~(0xff << uiNumberOfBits);
-        bitstream.m_num_held_bits -= uiNumberOfBits;
-        
-        return retval;
+        if (memcmp(&src[i], pattern, 4) == 0)
+        {
+            return &src[i];
+        }
     }
-    
-    /* all num_held_bits will go into retval
-     *   => need to mask leftover bits from previous extractions
-     *   => align retval with top of extracted word */
-    /* n=5, len(H)=3: ---- -VVV, mask=0x07, shift_up=5-3=2,
-     * n=9, len(H)=3: ---- -VVV, mask=0x07, shift_up=9-3=6 */
-    uiNumberOfBits -= bitstream.m_num_held_bits;
-    retval = bitstream.m_held_bits & ~(0xff << bitstream.m_num_held_bits);
-    retval <<= uiNumberOfBits;
-    
-    /* number of whole bytes that need to be loaded to form retval */
-    /* n=32, len(H)=0, load 4bytes, shift_down=0
-     * n=32, len(H)=1, load 4bytes, shift_down=1
-     * n=31, len(H)=1, load 4bytes, shift_down=1+1
-     * n=8,  len(H)=0, load 1byte,  shift_down=0
-     * n=8,  len(H)=3, load 1byte,  shift_down=3
-     * n=5,  len(H)=1, load 1byte,  shift_down=1+3
-     */
-    uint32_t aligned_word = 0;
-    uint32_t num_bytes_to_load = (uiNumberOfBits - 1) >> 3;
-    
-    //assert(m_fifo_idx + num_bytes_to_load < m_fifo->size());
-    
-    switch (num_bytes_to_load)
-    {
-        case 3: aligned_word  = (bitstream.m_fifo)[bitstream.m_fifo_idx++] << 24;
-        case 2: aligned_word |= (bitstream.m_fifo)[bitstream.m_fifo_idx++] << 16;
-        case 1: aligned_word |= (bitstream.m_fifo)[bitstream.m_fifo_idx++] << 8;
-        case 0: aligned_word |= (bitstream.m_fifo)[bitstream.m_fifo_idx++];
-    }
-    
-    /* resolve remainder bits */
-    uint32_t next_num_held_bits = (32 - uiNumberOfBits) % 8;
-    
-    /* copy required part of aligned_word into retval */
-    retval |= aligned_word >> next_num_held_bits;
-    
-    /* store held bits */
-    bitstream.m_num_held_bits = next_num_held_bits;
-    bitstream.m_held_bits = (uint8_t) (aligned_word & 0xFF);
-
-    //printf("m_num_held_bits=%d\n", next_num_held_bits);
-
-    return retval;
+    return NULL;
 }
-#endif
+
+
+bool chkDistance(uint8_t distance, uint8_t adaptation_field_control, uint8_t adaptation_extension_length)
+{
+    int base_ts_hdr_len = 4;
+
+    if (adaptation_field_control == 3)
+    {
+        base_ts_hdr_len += 1 + adaptation_extension_length;
+    }
+
+    return distance == base_ts_hdr_len;
+}
 
 
 int main(int argc, char *argv[])
@@ -106,6 +49,7 @@ int main(int argc, char *argv[])
     int fd;
     uint16_t VPID;
     ssize_t rd_sz;
+    vector< pair<uint8_t *, uint32_t> > copyQ;
         
     if (argc < 3)
     {
@@ -139,57 +83,136 @@ int main(int argc, char *argv[])
 
     rd_sz = read(fd, data, file_size);
 
-    uint8_t *ptr = data;
+    uint8_t *ts_ptr = data;
 
     uint8_t last_continuity_counter = 0xF;
-    for (; ptr - data < file_size; ptr += 188) {
+    for (; ts_ptr - data < file_size; ts_ptr += 188)
+    {
         InputBitstream_t ibs = {0};
 
-        ibs.m_fifo = ptr;
+        ibs.m_fifo = ts_ptr;
 
-        uint8_t sync_byte = READ_CODE(ibs, 8, "sync_byte");
-        uint8_t transport_error_indicator = READ_CODE(ibs, 1, "transport_error_indicator");
-        uint8_t payload_unit_start_indicator = READ_CODE(ibs, 1, "");
-        uint8_t transport_priority = READ_CODE(ibs, 1, "");
-        uint16_t PID = READ_CODE(ibs, 13, "");
-        uint8_t transport_scrambling_control = READ_CODE(ibs, 2, "");
-        uint8_t adaptation_field_control = READ_CODE(ibs, 2, "");
-        uint8_t continuity_counter = READ_CODE(ibs, 4, "");
+        uint8_t sync_byte                       = READ_CODE(ibs, 8, "sync_byte");
+        bool transport_error_indicator          = READ_FLAG(ibs, "transport_error_indicator");
+        bool payload_unit_start_indicator       = READ_FLAG(ibs, "payload_unit_start_indicator");
+        bool transport_priority                 = READ_FLAG(ibs, "transport_priority");
+        uint16_t PID                            = READ_CODE(ibs, 13, "PID");
+        uint8_t transport_scrambling_control    = READ_CODE(ibs, 2, "transport_scrambling_control");
+        uint8_t adaptation_field_control        = READ_CODE(ibs, 2, "adaptation_field_control");
+        uint8_t continuity_counter              = READ_CODE(ibs, 4, "continuity_counter");
 
         if (sync_byte != 0x47)
         {
-            printf("Invalid TS stream at 0x%lx, please chk!\n", ptr - data);
+            printf("Invalid TS stream at 0x%lx, please chk!\n", ts_ptr - data);
             exit(-1);
         }
 
-
-        printf("transport_error_indicator=%d payload_unit_start_indicator=%d transport_priority=%d PID=0x%x\n", transport_error_indicator, payload_unit_start_indicator, transport_priority, PID);
-
         if (PID == VPID)
         {
+            printf("-----\n");
+            printf("transport_error_indicator=%d payload_unit_start_indicator=%d transport_priority=%d PID=0x%x\n", transport_error_indicator, payload_unit_start_indicator, transport_priority, PID);
             printf("transport_scrambling_control=%d adaptation_field_control=%d continuity_counter=%d\n", transport_scrambling_control, adaptation_field_control, continuity_counter);
 
-            if (adaptation_field_control == 3)
+            if (payload_unit_start_indicator)
             {
-                printf("Offset=0x%lx\n", ptr-data);
-                uint8_t adaptation_extension_length = READ_CODE(ibs, 8, "");
+                printf("XXXX Offset=0x%lx\n", ts_ptr - data);
+
+                uint8_t adaptation_extension_length = 0;
+
+                if (adaptation_field_control == 3)
+                {
+                    adaptation_extension_length = READ_CODE(ibs, 8, "adaptation_extension_length");
+                }
+
+                uint8_t PESstartCode[] = { 0x00, 0x00, 0x01, 0xE0 };
+
+                uint8_t *pes = findPattern(&ibs.m_fifo[4 + adaptation_extension_length], PESstartCode, TS_PKT_SIZE - (4 + adaptation_extension_length));
+                if (pes == NULL)
+                {
+                    printf("fucked up!\n");
+                    exit(-1);
+                }
+                
+                printf("PES found! Offset=0x%lx distance=%ld\n", pes - data, pes - ts_ptr);
+
+                if (!chkDistance(pes - ts_ptr, adaptation_field_control, adaptation_extension_length))
+                {
+                    exit(-1);
+                }
+
+                // copy payload excluding PES header
+                uint8_t *copy = pes + PES_PKT_HDR_LEN; // I am cheating here cuz 19 is from analyzer
+                uint32_t cpSize = ts_ptr + TS_PKT_SIZE - copy;
+
+                copyQ.push_back( {copy, cpSize} );
+            }
+            else if (adaptation_field_control == 3)
+            {
+                printf("YYYYY Offset=0x%lx\n", ts_ptr-data);
+                uint8_t adaptation_extension_length = READ_CODE(ibs, 8, "adaptation_extension_length");
 
                 // copy what's leftover.
-                uint8_t *copy = ptr + 6;
-                uint32_t cpSize = 188 - 6 - adaptation_extension_length;
-                // copy from copy ptr & cpSize, which is the leftover ES;
+                uint32_t cpSize = TS_PKT_SIZE - 5 - adaptation_extension_length;
+                uint8_t *copy = ts_ptr + TS_PKT_SIZE - cpSize;
+
+                // copy from copy ts_ptr & cpSize, which is the leftover ES;
+                //for (int i = 0; i < cpSize; i++)
+                //{
+                //    printf("0x%02x ", copy[i]);
+                //}
                 
+                //printf("copy %d bytes\n", cpSize);
+                copyQ.push_back( {copy, cpSize} );   
+            }
+            else if (adaptation_field_control == 2)
+            {
+                // do not copy anything
+            }
+            else
+            {
+                // copy what's leftover.
+                uint32_t cpSize = TS_PKT_SIZE - 4;
+                uint8_t *copy = ts_ptr + 4;
+
+                copyQ.push_back( {copy, cpSize} );
             }
 
             if (last_continuity_counter != 0xF && (last_continuity_counter+1) % 16 != continuity_counter)
             {
-                printf("Discontinous counter! Offset=0x%lx\n", ptr-data);
+                printf("Discontinous counter! Offset=0x%lx\n", ts_ptr-data);
             }
             else
             {
                 last_continuity_counter = continuity_counter;
             }
         }
+    }
+
+    // Flush output
+    {
+        char output[256];
+        char *cp = strrchr(argv[1], '.');
+
+        strncpy(output, argv[1], cp - argv[1]);
+        strcat(output, "_fix_frame_num");
+        strcat(output, cp);
+
+        int ofd = open(output, O_RDWR | O_CREAT, S_IRUSR);
+
+        for (auto [start, len] : copyQ)
+        {
+            if (start - data > 0x3cb366) // 1st I
+            {
+                write(ofd, start, len);
+                //if (start - data > 0x44c994)
+                //{
+                //    printf("copy 0x%lx : %d\n", start - data, len);
+                //    exit(-1);
+                //}
+            }
+        }
+
+        close(ofd);
     }
 
     return 0;

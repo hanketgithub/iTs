@@ -114,3 +114,20 @@ uint32_t READ_CODE
 
     return ret;
 }
+
+
+bool READ_FLAG
+(
+    InputBitstream_t &bitstream,
+    const char *name
+)
+{
+    bool ret;
+
+    ret = (bool) (read_bits(bitstream, 1) & 0x01);
+    
+    TRACE("%-50s u(1)  : %u\n", name, ret);
+
+    return ret;
+}
+

@@ -21,6 +21,11 @@ uint32_t READ_CODE
     const char *name
 );
 
+bool READ_FLAG
+(
+    InputBitstream_t &bitstream,
+    const char *name
+);
 
 #endif
 
