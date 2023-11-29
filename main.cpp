@@ -12,8 +12,11 @@
 
 #include "bits.h"
 
-#define TS_PKT_SIZE         188
-#define PES_PKT_HDR_LEN     19   // should not be hard-coded, just for 20230221_original_asi_source_fix_frame_num.ts
+#define TS_PKT_SIZE                         188
+#define TS_PKT_HDR_MANDATORY_SIZE           4   // Sync_byte to Counitnuity_counter
+#define TS_PKT_HDR_ADAPTION_FIELD_LEN_SIZE  1
+
+#define PES_PKT_HDR_LEN             19   // should not be hard-coded, just for 20230221_original_asi_source_fix_frame_num.ts
 
 using namespace std;
 
@@ -109,14 +112,12 @@ int main(int argc, char *argv[])
 
         if (PID == VPID)
         {
-            printf("-----\n");
-            printf("transport_error_indicator=%d payload_unit_start_indicator=%d transport_priority=%d PID=0x%x\n", transport_error_indicator, payload_unit_start_indicator, transport_priority, PID);
-            printf("transport_scrambling_control=%d adaptation_field_control=%d continuity_counter=%d\n", transport_scrambling_control, adaptation_field_control, continuity_counter);
+            printf("-----Offset=0x%lx\n", ts_ptr - data);
+            //printf("transport_error_indicator=%d payload_unit_start_indicator=%d transport_priority=%d PID=0x%x\n", transport_error_indicator, payload_unit_start_indicator, transport_priority, PID);
+            //printf("transport_scrambling_control=%d adaptation_field_control=%d continuity_counter=%d\n", transport_scrambling_control, adaptation_field_control, continuity_counter);
 
             if (payload_unit_start_indicator)
             {
-                printf("XXXX Offset=0x%lx\n", ts_ptr - data);
-
                 uint8_t adaptation_extension_length = 0;
 
                 if (adaptation_field_control == 3)
@@ -126,14 +127,14 @@ int main(int argc, char *argv[])
 
                 uint8_t PESstartCode[] = { 0x00, 0x00, 0x01, 0xE0 };
 
-                uint8_t *pes = findPattern(&ibs.m_fifo[4 + adaptation_extension_length], PESstartCode, TS_PKT_SIZE - (4 + adaptation_extension_length));
+                uint8_t *pes = findPattern(&ibs.m_fifo[TS_PKT_HDR_MANDATORY_SIZE + adaptation_extension_length], PESstartCode, TS_PKT_SIZE - (TS_PKT_HDR_MANDATORY_SIZE + adaptation_extension_length));
                 if (pes == NULL)
                 {
                     printf("fucked up!\n");
                     exit(-1);
                 }
                 
-                printf("PES found! Offset=0x%lx distance=%ld\n", pes - data, pes - ts_ptr);
+                //printf("PES found! Offset=0x%lx distance=%ld\n", pes - data, pes - ts_ptr);
 
                 if (!chkDistance(pes - ts_ptr, adaptation_field_control, adaptation_extension_length))
                 {
@@ -141,27 +142,19 @@ int main(int argc, char *argv[])
                 }
 
                 // copy payload excluding PES header
-                uint8_t *copy = pes + PES_PKT_HDR_LEN; // I am cheating here cuz 19 is from analyzer
+                uint8_t *copy = pes + PES_PKT_HDR_LEN;
                 uint32_t cpSize = ts_ptr + TS_PKT_SIZE - copy;
 
                 copyQ.push_back( {copy, cpSize} );
             }
             else if (adaptation_field_control == 3)
             {
-                printf("YYYYY Offset=0x%lx\n", ts_ptr-data);
                 uint8_t adaptation_extension_length = READ_CODE(ibs, 8, "adaptation_extension_length");
 
                 // copy what's leftover.
-                uint32_t cpSize = TS_PKT_SIZE - 5 - adaptation_extension_length;
+                uint32_t cpSize = TS_PKT_SIZE - (TS_PKT_HDR_MANDATORY_SIZE + TS_PKT_HDR_ADAPTION_FIELD_LEN_SIZE) - adaptation_extension_length;
                 uint8_t *copy = ts_ptr + TS_PKT_SIZE - cpSize;
 
-                // copy from copy ts_ptr & cpSize, which is the leftover ES;
-                //for (int i = 0; i < cpSize; i++)
-                //{
-                //    printf("0x%02x ", copy[i]);
-                //}
-                
-                //printf("copy %d bytes\n", cpSize);
                 copyQ.push_back( {copy, cpSize} );   
             }
             else if (adaptation_field_control == 2)
@@ -171,8 +164,8 @@ int main(int argc, char *argv[])
             else
             {
                 // copy what's leftover.
-                uint32_t cpSize = TS_PKT_SIZE - 4;
-                uint8_t *copy = ts_ptr + 4;
+                uint32_t cpSize = TS_PKT_SIZE - TS_PKT_HDR_MANDATORY_SIZE;
+                uint8_t *copy = ts_ptr + TS_PKT_HDR_MANDATORY_SIZE;
 
                 copyQ.push_back( {copy, cpSize} );
             }
@@ -204,11 +197,11 @@ int main(int argc, char *argv[])
             if (start - data > 0x3cb366) // 1st I
             {
                 write(ofd, start, len);
-                //if (start - data > 0x44c994)
-                //{
-                //    printf("copy 0x%lx : %d\n", start - data, len);
-                //    exit(-1);
-                //}
+                if (start - data > 0x44c994)
+                {
+                    printf("copy 0x%lx : %d\n", start - data, len);
+                    exit(-1);
+                }
             }
         }
 
